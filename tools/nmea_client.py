@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Test client for the ESP32 NMEA stream.
 
-Opens several concurrent HTTP connections to the board, decodes the chunked
+Opens several concurrent HTTPS connections to the board, decodes the chunked
 NMEA stream on each, checks every sentence's checksum, and prints per-connection
 statistics periodically. Uses only the Python standard library.
 
+The board's self-signed certificate is verified against certs/server.crt.pem
+(from tools/gen-cert.sh) when that exists; the address used must be one of the
+names the certificate was generated for. Use --insecure to skip verification.
+
 Examples:
     tools/nmea_client.py 192.168.1.50                # 4 connections, stats every 5 s
-    tools/nmea_client.py 192.168.1.50 -n 5           # one more than the board's 4 slots
+    tools/nmea_client.py 192.168.1.50 -n 33          # one more than the board's 32 slots
     tools/nmea_client.py 192.168.1.50 -n 1 --show    # print the sentences too
     tools/nmea_client.py 192.168.1.50 --reconnect --duration 60
 """
@@ -16,6 +20,7 @@ import argparse
 import asyncio
 import functools
 import os
+import ssl
 import sys
 import time
 
@@ -92,7 +97,13 @@ async def stream(conn, args):
     """Connect once and consume the stream until it ends."""
     conn.state = "connecting"
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(args.host, args.port), args.timeout
+        asyncio.open_connection(
+            args.host,
+            args.port,
+            ssl=args.ssl_context,
+            server_hostname=args.host if args.ssl_context else None,
+        ),
+        args.timeout,
     )
     try:
         conn.connects += 1
@@ -221,12 +232,43 @@ async def main(args):
     return 1 if bad or any(c.connects == 0 for c in conns) else 0
 
 
+DEFAULT_CAFILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "certs", "server.crt.pem"
+)
+
+
+def make_ssl_context(args):
+    """Return the TLS context for the connections, or None for plain HTTP."""
+    if args.plain:
+        return None
+    if args.insecure:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    if not os.path.exists(args.cafile):
+        sys.exit(f"{args.cafile} not found: run tools/gen-cert.sh, or use --insecure")
+    return ssl.create_default_context(cafile=args.cafile)
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Open several connections to the ESP32 NMEA stream and check them."
     )
     p.add_argument("host", help="board IP address or hostname")
-    p.add_argument("-p", "--port", type=int, default=80, help="HTTP port (default 80)")
+    p.add_argument(
+        "-p", "--port", type=int,
+        help="port (default 443, or 80 with --plain)",
+    )
+    p.add_argument("--plain", action="store_true", help="use plain HTTP instead of HTTPS")
+    p.add_argument(
+        "--cafile", default=DEFAULT_CAFILE, metavar="PATH",
+        help="certificate to verify the board against (default certs/server.crt.pem)",
+    )
+    p.add_argument(
+        "-k", "--insecure", action="store_true",
+        help="don't verify the board's certificate",
+    )
     p.add_argument("--path", default="/", help="request path (default /)")
     p.add_argument(
         "-n", "--connections", type=int, default=4,
@@ -262,7 +304,11 @@ def parse_args():
 
 if __name__ == "__main__":
     try:
-        sys.exit(asyncio.run(main(parse_args())))
+        args = parse_args()
+        args.ssl_context = make_ssl_context(args)
+        if args.port is None:
+            args.port = 80 if args.plain else 443
+        sys.exit(asyncio.run(main(args)))
     except BrokenPipeError:
         # Output was piped into something like `head` that has exited.
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())

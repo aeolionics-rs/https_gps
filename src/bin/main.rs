@@ -2,6 +2,8 @@
 #![no_main]
 #![feature(allocator_api)]
 #![feature(impl_trait_in_assoc_type)]
+// The HTTPS server task's future type is nested deeper than the default limit.
+#![recursion_limit = "256"]
 #![deny(
     clippy::mem_forget,
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
@@ -14,12 +16,14 @@ use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::interrupt::Priority;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::sta::StationConfig;
 use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ControllerConfig, Interface, WifiController,
 };
+use esp_rtos::embassy::InterruptExecutor;
 use log::{info, warn};
 use static_cell::StaticCell;
 
@@ -83,12 +87,21 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(stats::stats_task().unwrap());
 
-    gps::spawn(
-        spawner,
-        peripherals.UART1,
-        peripherals.GPIO5,
-        peripherals.GPIO6,
-        peripherals.GPIO7,
+    // The GPS reader runs on a higher-priority interrupt executor so that a
+    // TLS handshake, which holds the CPU for a long time, can't delay it long
+    // enough to overflow the UART's RX FIFO.
+    static GPS_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
+    let gps_spawner = GPS_EXECUTOR
+        .init(InterruptExecutor::new(peripherals.FROM_CPU_INTR1))
+        .start(Priority::Priority2);
+    gps_spawner.spawn(
+        gps::gps_task(
+            peripherals.UART1,
+            peripherals.GPIO5,
+            peripherals.GPIO6,
+            peripherals.GPIO7,
+        )
+        .unwrap(),
     );
 
     let station_config = Config::Station(
@@ -109,6 +122,9 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to initialize Wi-Fi controller");
     let wifi_interface = Interface::station();
 
+    // Needs Wi-Fi to be initialized, as that enables the TRNG's entropy source.
+    let tls = tls::init(peripherals.SHA, peripherals.RSA, peripherals.AES);
+
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
@@ -124,16 +140,16 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    web::spawn(spawner, stack);
+    web::spawn(spawner, stack, tls);
 
     // Log the address each time DHCP (re)configures the interface.
     loop {
         stack.wait_config_up().await;
         if let Some(config) = stack.config_v4() {
             info!(
-                "HTTP server listening on http://{}:{}/",
+                "HTTPS server listening on https://{}:{}/",
                 config.address.address(),
-                web::HTTP_PORT
+                web::HTTPS_PORT
             );
         }
         stack.wait_config_down().await;
@@ -167,7 +183,88 @@ async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
 
-/// HTTP server: a pool of picoserve tasks sharing one router.
+/// Mbed TLS set-up: PSRAM allocation, hardware acceleration and the RNG.
+mod tls {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+
+    use esp_alloc::MemoryCapability;
+    use esp_hal::peripherals::{AES, RSA, SHA};
+    use esp_hal::rng::Trng;
+    use mbedtls_rs::sys::hook::backend::esp::{EspAccel, EspAccelQueue, EspHooksGuard};
+    use mbedtls_rs::{Tls, TlsReference};
+    use static_cell::StaticCell;
+
+    /// Bytes in front of each Mbed TLS allocation, recording its size. Also
+    /// keeps the returned memory 8-byte aligned.
+    const HEADER: usize = 8;
+
+    /// Mbed TLS allocator that uses PSRAM. Each TLS session needs ~32 KB of
+    /// record buffers, which would exhaust the internal RAM the Wi-Fi driver
+    /// needs. Mbed TLS is C and doesn't use atomics, so PSRAM is safe for it.
+    unsafe extern "C" fn psram_calloc(count: usize, size: usize) -> *mut c_void {
+        let Some(total) = count
+            .checked_mul(size)
+            .and_then(|bytes| bytes.checked_add(HEADER))
+        else {
+            return core::ptr::null_mut();
+        };
+        let Ok(layout) = Layout::from_size_align(total, HEADER) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: `layout` has a non-zero size.
+        let base = unsafe { esp_alloc::HEAP.alloc_caps(MemoryCapability::External.into(), layout) };
+        if base.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `base` points to `total` writable bytes, aligned for `usize`.
+        unsafe {
+            base.write_bytes(0, total);
+            base.cast::<usize>().write(total);
+            base.add(HEADER).cast()
+        }
+    }
+
+    unsafe extern "C" fn psram_free(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        // SAFETY: `ptr` came from `psram_calloc`, so the header holds the size
+        // of the allocation it was carved from.
+        unsafe {
+            let base = ptr.cast::<u8>().sub(HEADER);
+            let total = base.cast::<usize>().read();
+            esp_alloc::HEAP.dealloc(base, Layout::from_size_align_unchecked(total, HEADER));
+        }
+    }
+
+    /// Initializes Mbed TLS. Must be called once, after Wi-Fi is initialized.
+    pub fn init(sha: SHA<'static>, rsa: RSA<'static>, aes: AES<'static>) -> TlsReference<'static> {
+        // SAFETY: called before Mbed TLS allocates anything.
+        unsafe {
+            mbedtls_rs::sys::mbedtls_platform_set_calloc_free(Some(psram_calloc), Some(psram_free));
+        }
+
+        // Route SHA, AES and RSA (modular exponentiation) to the hardware
+        // accelerators. These live forever, so the hooks are never removed.
+        static ACCEL: StaticCell<EspAccel<'static>> = StaticCell::new();
+        static QUEUE: StaticCell<EspAccelQueue<'static, 'static>> = StaticCell::new();
+        static HOOKS: StaticCell<EspHooksGuard<'static>> = StaticCell::new();
+        let accel = ACCEL.init(EspAccel::new().with_sha(sha).with_rsa(rsa).with_aes(aes));
+        let queue: &'static EspAccelQueue = QUEUE.init(accel.start());
+        // SAFETY: nothing has used Mbed TLS yet, and the guard is never dropped.
+        HOOKS.init(unsafe { queue.hook() });
+
+        static RNG: StaticCell<Trng> = StaticCell::new();
+        let rng = RNG.init(Trng::try_new().expect("TRNG unavailable; initialize Wi-Fi first"));
+
+        static TLS: StaticCell<Tls<'static>> = StaticCell::new();
+        TLS.init(Tls::new(rng).expect("Mbed TLS already initialized"))
+            .reference()
+    }
+}
+
+/// HTTPS server: a pool of picoserve tasks sharing one router.
 mod web {
     #![allow(
         clippy::large_stack_frames,
@@ -176,21 +273,38 @@ mod web {
     )]
 
     use alloc::boxed::Box;
+    use core::task::Poll;
+
     use embassy_executor::Spawner;
     use embassy_net::Stack;
+    use embassy_net::tcp::{TcpReader, TcpSocket, TcpWriter};
     use embassy_sync::pubsub::WaitResult;
+    use embassy_time::{Duration, Instant, with_timeout};
     use esp_alloc::ExternalMemory;
-    use log::warn;
+    use log::{info, warn};
+    use mbedtls_rs::io::{ErrorType, Read, Write};
+    use mbedtls_rs::{
+        Certificate, Credentials, PrivateKey, ServerSessionConfig, Session, SessionConfig,
+        SessionError, Split, TlsReference, X509,
+    };
+    use picoserve::mem::{BorrowedBuffer, BorrowedCursor};
     use picoserve::response::chunked::{ChunkWriter, ChunkedResponse, Chunks, ChunksWritten};
     use picoserve::routing::{PathRouter, get};
-    use picoserve::{AppBuilder, AppRouter};
+    use picoserve::{AppBuilder, AppRouter, EmbassyRuntime, Timeouts, Timer};
 
     use crate::gps;
 
-    pub const HTTP_PORT: u16 = 80;
+    pub const HTTPS_PORT: u16 = 443;
 
-    /// Number of HTTP connections that can be served concurrently.
+    /// Number of HTTPS connections that can be served concurrently.
     pub const TASK_POOL_SIZE: usize = 32;
+
+    /// How long a client gets to complete the TLS handshake.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Self-signed certificate and private key (DER), from `tools/gen-cert.sh`.
+    const CERTIFICATE: &[u8] = include_bytes!("../../certs/server.crt.der");
+    const PRIVATE_KEY: &[u8] = include_bytes!("../../certs/server.key.der");
 
     struct AppProps;
 
@@ -246,10 +360,12 @@ mod web {
         tcp_rx: [u8; 1536],
         tcp_tx: [u8; 1536],
         http: [u8; 2048],
+        /// Collects small writes into one TLS record; see [`TlsWriter`].
+        tls_tx: [u8; 1024],
     }
 
-    /// Spawns [`TASK_POOL_SIZE`] server tasks listening on [`HTTP_PORT`].
-    pub fn spawn(spawner: Spawner, stack: Stack<'static>) {
+    /// Spawns [`TASK_POOL_SIZE`] server tasks listening on [`HTTPS_PORT`].
+    pub fn spawn(spawner: Spawner, stack: Stack<'static>, tls: TlsReference<'static>) {
         let app = picoserve::make_static!(AppRouter<AppProps>, AppProps.build_app());
         // smoltcp won't retransmit sooner than 1 s, so picoserve's default 1 s
         // write timeout would abort a stream on a single lost packet. 5 s
@@ -260,6 +376,15 @@ mod web {
         })
         .keep_connection_alive();
 
+        let credentials = Credentials {
+            certificate: Certificate::new_no_copy(CERTIFICATE).expect("invalid certificate"),
+            private_key: PrivateKey::new(X509::DER(PRIVATE_KEY), None).expect("invalid key"),
+        };
+        let session_config = picoserve::make_static!(
+            SessionConfig<'static>,
+            SessionConfig::Server(ServerSessionConfig::new(credentials))
+        );
+
         // Allocated zeroed in PSRAM so they never pass through the stack and
         // don't use internal RAM. They're needed for the life of the program.
         let buffers = Box::<[Buffers; TASK_POOL_SIZE], _>::new_zeroed_in(ExternalMemory);
@@ -267,7 +392,9 @@ mod web {
         let buffers = Box::leak(unsafe { buffers.assume_init() });
 
         for (task_id, buffers) in buffers.iter_mut().enumerate() {
-            spawner.spawn(web_task(task_id, stack, app, &CONFIG, buffers).unwrap());
+            spawner.spawn(
+                web_task(task_id, stack, app, &CONFIG, tls, session_config, buffers).unwrap(),
+            );
         }
     }
 
@@ -278,28 +405,237 @@ mod web {
         stack: Stack<'static>,
         app: &'static AppRouter<AppProps>,
         config: &'static picoserve::Config,
+        tls: TlsReference<'static>,
+        session_config: &'static SessionConfig<'static>,
         buffers: &'static mut Buffers,
     ) -> ! {
-        picoserve::Server::new(app, config, &mut buffers.http)
-            .listen_and_serve(
-                task_id,
-                stack,
-                HTTP_PORT,
-                &mut buffers.tcp_rx,
-                &mut buffers.tcp_tx,
-            )
-            .await
-            .into_never()
+        loop {
+            let mut socket = TcpSocket::new(stack, &mut buffers.tcp_rx, &mut buffers.tcp_tx);
+            if let Err(e) = socket.accept(HTTPS_PORT).await {
+                warn!("{task_id}: accept error: {e:?}");
+                continue;
+            }
+            let remote = socket.remote_endpoint();
+            socket.set_keep_alive(Some(Duration::from_secs(30)));
+            socket.set_timeout(Some(Duration::from_secs(45)));
+
+            let mut session = match Session::new(tls, TcpStream(socket), session_config) {
+                Ok(session) => session,
+                Err(e) => {
+                    warn!("{task_id}: couldn't create TLS session: {e:?}");
+                    continue;
+                }
+            };
+
+            let start = Instant::now();
+            match with_timeout(HANDSHAKE_TIMEOUT, session.connect()).await {
+                Ok(Ok(())) => info!(
+                    "{task_id}: TLS handshake with {remote:?} took {} ms",
+                    start.elapsed().as_millis()
+                ),
+                Ok(Err(e)) => {
+                    warn!("{task_id}: TLS handshake with {remote:?} failed: {e:?}");
+                    session.stream().0.abort();
+                    continue;
+                }
+                Err(_) => {
+                    warn!("{task_id}: TLS handshake with {remote:?} timed out");
+                    session.stream().0.abort();
+                    continue;
+                }
+            }
+
+            let socket = TlsSocket {
+                session,
+                tx_buffer: &mut buffers.tls_tx,
+            };
+            match picoserve::Server::new(app, config, &mut buffers.http)
+                .serve(socket)
+                .await
+            {
+                Ok(info) => info!(
+                    "{task_id}: {} requests handled from {remote:?}",
+                    info.handled_requests_count
+                ),
+                Err(e) => warn!("{task_id}: connection from {remote:?} ended: {e:?}"),
+            }
+        }
+    }
+
+    /// A TCP socket that mbedtls-rs can split into read and write halves.
+    struct TcpStream<'a>(TcpSocket<'a>);
+
+    impl ErrorType for TcpStream<'_> {
+        type Error = embassy_net::tcp::Error;
+    }
+
+    impl Read for TcpStream<'_> {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.0.read(buf).await
+        }
+    }
+
+    impl Write for TcpStream<'_> {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.0.write(buf).await
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().await
+        }
+    }
+
+    impl Split for TcpStream<'_> {
+        type Read<'a>
+            = TcpReader<'a>
+        where
+            Self: 'a;
+        type Write<'a>
+            = TcpWriter<'a>
+        where
+            Self: 'a;
+
+        fn split(&mut self) -> (Self::Read<'_>, Self::Write<'_>) {
+            self.0.split()
+        }
+    }
+
+    /// A TLS session over a TCP connection, in the form picoserve serves.
+    struct TlsSocket<'a> {
+        session: Session<'a, TcpStream<'a>>,
+        tx_buffer: &'a mut [u8],
+    }
+
+    impl<'s> picoserve::io::Socket<EmbassyRuntime> for TlsSocket<'s> {
+        type Error = SessionError;
+        type ReadHalf<'a>
+            = impl Read<Error = SessionError> + 'a
+        where
+            Self: 'a;
+        type WriteHalf<'a>
+            = TlsWriter<'a, impl Write<Error = SessionError> + 'a>
+        where
+            Self: 'a;
+
+        fn split(&mut self) -> (Self::ReadHalf<'_>, Self::WriteHalf<'_>) {
+            // The handshake has already completed, so splitting finishes
+            // without waiting on anything.
+            match embassy_futures::poll_once(self.session.split()) {
+                Poll::Ready(Ok((read, write))) => (
+                    read,
+                    TlsWriter {
+                        session: write,
+                        buffer: self.tx_buffer,
+                        len: 0,
+                    },
+                ),
+                _ => unreachable!("TLS session split before its handshake completed"),
+            }
+        }
+
+        async fn abort<T: Timer<EmbassyRuntime>>(
+            mut self,
+            timeouts: &Timeouts,
+            timer: &T,
+        ) -> Result<(), picoserve::Error<Self::Error>> {
+            let tcp = &mut self.session.stream().0;
+            tcp.abort();
+            timer
+                .run_with_timeout(timeouts.write, tcp.flush())
+                .await
+                .map_err(picoserve::Error::WriteTimeout)?
+                .map_err(|e| picoserve::Error::Write(SessionError::from_io(e)))
+        }
+
+        async fn shutdown<T: Timer<EmbassyRuntime>>(
+            mut self,
+            timeouts: &Timeouts,
+            timer: &T,
+        ) -> Result<(), picoserve::Error<Self::Error>> {
+            // Send the TLS close_notify, then close the TCP connection.
+            timer
+                .run_with_timeout(timeouts.write, self.session.close())
+                .await
+                .map_err(picoserve::Error::WriteTimeout)?
+                .map_err(picoserve::Error::Write)?;
+            let tcp = &mut self.session.stream().0;
+            tcp.close();
+            timer
+                .run_with_timeout(timeouts.write, tcp.flush())
+                .await
+                .map_err(picoserve::Error::WriteTimeout)?
+                .map_err(|e| picoserve::Error::Write(SessionError::from_io(e)))
+        }
+    }
+
+    /// The write half of a TLS session, buffered.
+    ///
+    /// picoserve writes a response in small pieces (each chunk's size line,
+    /// data and CR LF separately), and each write to the session becomes its
+    /// own TLS record with ~30 bytes of overhead. Collecting them here until a
+    /// flush, or until the buffer is full, sends one record instead.
+    struct TlsWriter<'a, W> {
+        session: W,
+        buffer: &'a mut [u8],
+        len: usize,
+    }
+
+    impl<W: Write> TlsWriter<'_, W> {
+        async fn drain(&mut self) -> Result<(), W::Error> {
+            if self.len > 0 {
+                self.session.write_all(&self.buffer[..self.len]).await?;
+                self.len = 0;
+            }
+            Ok(())
+        }
+    }
+
+    impl<W: Write> ErrorType for TlsWriter<'_, W> {
+        type Error = W::Error;
+    }
+
+    impl<W: Write> Write for TlsWriter<'_, W> {
+        async fn write(&mut self, data: &[u8]) -> Result<usize, Self::Error> {
+            if data.len() > self.buffer.len() - self.len {
+                self.drain().await?;
+            }
+            if data.len() >= self.buffer.len() {
+                return self.session.write(data).await;
+            }
+            self.buffer[self.len..self.len + data.len()].copy_from_slice(data);
+            self.len += data.len();
+            Ok(data.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.drain().await?;
+            self.session.flush().await
+        }
+    }
+
+    impl<W: Write> picoserve::io::Write for TlsWriter<'_, W> {
+        async fn write_with<F: FnOnce(BorrowedCursor<'_>) -> R, R>(
+            &mut self,
+            f: F,
+        ) -> Result<R, Self::Error> {
+            if self.len == self.buffer.len() {
+                self.drain().await?;
+            }
+            let mut unfilled = BorrowedBuffer::new(&mut self.buffer[self.len..]);
+            let output = f(unfilled.unfilled());
+            self.len += unfilled.len();
+            Ok(output)
+        }
     }
 }
 
-/// ATGM336H-6N-74 GNSS module: logs the NMEA 0183 sentences it outputs.
+/// ATGM336H-6N-74 GNSS module: reads and publishes the NMEA 0183 sentences it outputs.
 mod gps {
-    use embassy_executor::Spawner;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::pubsub::PubSubChannel;
     use esp_hal::Async;
-    use esp_hal::gpio::{InputPin, Level, Output, OutputConfig, OutputPin};
+    use esp_hal::gpio::{Level, Output, OutputConfig};
+    use esp_hal::peripherals::{GPIO5, GPIO6, GPIO7, UART1};
     use esp_hal::uart::{self, Uart, UartRx, UartTx};
     use heapless::Vec;
     use log::warn;
@@ -328,45 +664,23 @@ mod gps {
         0,
     > = PubSubChannel::new();
 
-    /// Starts the GPS and spawns a task that logs each sentence it sends.
+    /// Reads NMEA sentences from the GPS and publishes them to [`SENTENCES`].
     ///
     /// Pins are named from the GPS's side: `gps_tx` is its TXD0 output (module
     /// pin 2, our RX), `gps_rx` its RXD0 input (pin 3, our TX), and `gps_reset`
-    /// its active-low nRESET (pin 9).
-    pub fn spawn(
-        spawner: Spawner,
-        uart: impl uart::Instance + 'static,
-        gps_tx: impl InputPin + 'static,
-        gps_rx: impl OutputPin + 'static,
-        gps_reset: impl OutputPin + 'static,
-    ) {
-        // Hold the GPS out of reset.
-        let reset = Output::new(gps_reset, Level::High, OutputConfig::default());
-
-        // Wake the reader when the 128-byte RX FIFO holds 32 bytes, leaving
-        // ~8 ms of headroom at 115200 baud. The default (120) leaves under
-        // 1 ms, which overflows when the executor is busy with network traffic.
-        let config = uart::Config::default()
-            .with_baudrate(BAUD_RATE)
-            .with_rx(uart::RxConfig::default().with_fifo_full_threshold(32));
-        let (rx, tx) = Uart::new(uart, config)
-            .expect("invalid GPS UART config")
-            .with_rx(gps_tx)
-            .with_tx(gps_rx)
-            .into_async()
-            .split();
-
-        spawner.spawn(gps_task(rx, tx, reset).unwrap());
-    }
-
-    // `_tx` and `_reset` are held so their pins stay configured; TX is unused
-    // until we need to send commands to the GPS.
+    /// its active-low nRESET (pin 9). The UART is set up here so that its
+    /// interrupt is handled in the context of the executor this task runs on.
     #[embassy_executor::task]
-    async fn gps_task(
-        mut rx: UartRx<'static, Async>,
-        _tx: UartTx<'static, Async>,
-        _reset: Output<'static>,
+    pub async fn gps_task(
+        uart: UART1<'static>,
+        gps_tx: GPIO5<'static>,
+        gps_rx: GPIO6<'static>,
+        gps_reset: GPIO7<'static>,
     ) {
+        // `_tx` and `_reset` are held so their pins stay configured; TX is
+        // unused until we need to send commands to the GPS.
+        let (mut rx, _tx, _reset) = open(uart, gps_tx, gps_rx, gps_reset);
+
         let mut chunk = [0u8; 64];
         let mut line = [0u8; MAX_SENTENCE_LEN];
         let mut len = 0;
@@ -405,6 +719,40 @@ mod gps {
                 }
             }
         }
+    }
+
+    /// Sets up the GPS UART and releases the GPS from reset.
+    ///
+    /// Kept out of line so that its stack usage isn't part of every poll of
+    /// [`gps_task`]: that runs in interrupt context, on the stack of whatever
+    /// it interrupted, which may be one of the Wi-Fi driver's small threads.
+    #[inline(never)]
+    fn open(
+        uart: UART1<'static>,
+        gps_tx: GPIO5<'static>,
+        gps_rx: GPIO6<'static>,
+        gps_reset: GPIO7<'static>,
+    ) -> (
+        UartRx<'static, Async>,
+        UartTx<'static, Async>,
+        Output<'static>,
+    ) {
+        // Hold the GPS out of reset.
+        let reset = Output::new(gps_reset, Level::High, OutputConfig::default());
+
+        // Wake the reader when the 128-byte RX FIFO holds 32 bytes, leaving
+        // ~8 ms of headroom at 115200 baud. The default (120) leaves under
+        // 1 ms, which overflows when the executor is busy.
+        let config = uart::Config::default()
+            .with_baudrate(BAUD_RATE)
+            .with_rx(uart::RxConfig::default().with_fifo_full_threshold(32));
+        let (rx, tx) = Uart::new(uart, config)
+            .expect("invalid GPS UART config")
+            .with_rx(gps_tx)
+            .with_tx(gps_rx)
+            .into_async()
+            .split();
+        (rx, tx, reset)
     }
 
     /// Publishes a sentence (without its line ending) to [`SENTENCES`].

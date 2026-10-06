@@ -18,6 +18,7 @@ esp32s3 = [
     "esp-println/esp32s3",
     "esp-radio/esp32s3",
     "esp-rtos/esp32s3",
+    "mbedtls-rs/esp32s3",
 ]
 
 [dependencies]
@@ -54,6 +55,8 @@ embassy-net = { version = "0.9.1", features = [
 embassy-sync = "0.8.0"
 embassy-time = { version = "0.5.0", features = ["log"] }
 heapless = "0.9.3"
+embassy-futures = "0.1.2"
+mbedtls-rs = { version = "0.3.0", features = ["esp32s3", "log"] }
 picoserve = { version = "0.20.1", features = ["embassy", "log"] }
 static_cell = "2.1.1"
 

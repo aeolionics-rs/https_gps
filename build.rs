@@ -1,8 +1,24 @@
 fn main() {
     linker_be_nice();
     check_xtensa_linker_available();
+    check_https_certificate();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+}
+
+/// The firmware embeds a locally generated certificate and key; fail early with
+/// a helpful message if they haven't been generated.
+fn check_https_certificate() {
+    println!("cargo:rerun-if-changed=build.rs");
+    for file in ["certs/server.crt.der", "certs/server.key.der"] {
+        println!("cargo:rerun-if-changed={file}");
+        if !std::path::Path::new(file).exists() {
+            panic!(
+                "{file} is missing. Generate the HTTPS certificate with \
+                 `tools/gen-cert.sh [board-ip-or-hostname ...]`"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

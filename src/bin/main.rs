@@ -98,11 +98,15 @@ async fn main(spawner: Spawner) -> ! {
                 PASSWORD.try_into().expect("password is too long"),
             )),
     );
-    let controller = WifiController::new(
-        peripherals.WIFI,
-        ControllerConfig::default().with_initial_config(station_config),
-    )
-    .expect("Failed to initialize Wi-Fi controller");
+    // The default queues (5 RX, 3 TX frames) drop packets when many HTTP
+    // streams send at once, and each loss stalls a stream for smoltcp's 1 s
+    // minimum retransmission timeout.
+    let controller_config = ControllerConfig::default()
+        .with_initial_config(station_config)
+        .with_rx_queue_size(16)
+        .with_tx_queue_size(8);
+    let controller = WifiController::new(peripherals.WIFI, controller_config)
+        .expect("Failed to initialize Wi-Fi controller");
     let wifi_interface = Interface::station();
 
     let rng = Rng::new();
@@ -186,7 +190,7 @@ mod web {
     pub const HTTP_PORT: u16 = 80;
 
     /// Number of HTTP connections that can be served concurrently.
-    pub const TASK_POOL_SIZE: usize = 4;
+    pub const TASK_POOL_SIZE: usize = 32;
 
     struct AppProps;
 
@@ -218,15 +222,21 @@ mod web {
 
             // Runs until a write fails because the client has gone away.
             loop {
-                match sentences.next_message().await {
-                    WaitResult::Message(sentence) => {
-                        writer.write_chunk(&sentence).await?;
-                        writer.flush().await?;
+                // Wait for a sentence, then also send any already queued behind
+                // it before flushing. The GPS sends its sentences in a burst
+                // once a second, and `flush` waits for the client's ACK, so
+                // flushing per sentence would cost a round trip each time.
+                let mut next = Some(sentences.next_message().await);
+                while let Some(result) = next {
+                    match result {
+                        WaitResult::Message(sentence) => writer.write_chunk(&sentence).await?,
+                        WaitResult::Lagged(n) => {
+                            warn!("NMEA stream client fell behind; skipped {n} sentences")
+                        }
                     }
-                    WaitResult::Lagged(n) => {
-                        warn!("NMEA stream client fell behind; skipped {n} sentences")
-                    }
+                    next = sentences.try_next_message();
                 }
+                writer.flush().await?;
             }
         }
     }
@@ -241,8 +251,14 @@ mod web {
     /// Spawns [`TASK_POOL_SIZE`] server tasks listening on [`HTTP_PORT`].
     pub fn spawn(spawner: Spawner, stack: Stack<'static>) {
         let app = picoserve::make_static!(AppRouter<AppProps>, AppProps.build_app());
-        static CONFIG: picoserve::Config =
-            picoserve::Config::const_default().keep_connection_alive();
+        // smoltcp won't retransmit sooner than 1 s, so picoserve's default 1 s
+        // write timeout would abort a stream on a single lost packet. 5 s
+        // allows for two retransmissions.
+        static CONFIG: picoserve::Config = picoserve::Config::new(picoserve::Timeouts {
+            write: embassy_time::Duration::from_secs(5),
+            ..picoserve::Timeouts::const_default()
+        })
+        .keep_connection_alive();
 
         // Allocated zeroed in PSRAM so they never pass through the stack and
         // don't use internal RAM. They're needed for the life of the program.

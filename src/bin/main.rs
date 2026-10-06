@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(allocator_api)]
 #![feature(impl_trait_in_assoc_type)]
 #![deny(
     clippy::mem_forget,
@@ -160,12 +161,13 @@ mod web {
         spawned; embassy's task macro doesn't forward attributes to its generated wrapper"
     )]
 
+    use alloc::boxed::Box;
     use embassy_executor::Spawner;
     use embassy_net::Stack;
+    use esp_alloc::ExternalMemory;
     use picoserve::response::File;
     use picoserve::routing::{PathRouter, get_service};
     use picoserve::{AppBuilder, AppRouter};
-    use static_cell::ConstStaticCell;
 
     pub const HTTP_PORT: u16 = 80;
 
@@ -200,18 +202,13 @@ mod web {
         static CONFIG: picoserve::Config =
             picoserve::Config::const_default().keep_connection_alive();
 
-        // Built at compile time so the buffers never pass through the stack.
-        static BUFFERS: ConstStaticCell<[Buffers; TASK_POOL_SIZE]> = ConstStaticCell::new(
-            [const {
-                Buffers {
-                    tcp_rx: [0; 1536],
-                    tcp_tx: [0; 1536],
-                    http: [0; 2048],
-                }
-            }; TASK_POOL_SIZE],
-        );
+        // Allocated zeroed in PSRAM so they never pass through the stack and
+        // don't use internal RAM. They're needed for the life of the program.
+        let buffers = Box::<[Buffers; TASK_POOL_SIZE], _>::new_zeroed_in(ExternalMemory);
+        // SAFETY: `Buffers` is plain byte arrays, so all zeroes is a valid value.
+        let buffers = Box::leak(unsafe { buffers.assume_init() });
 
-        for (task_id, buffers) in BUFFERS.take().iter_mut().enumerate() {
+        for (task_id, buffers) in buffers.iter_mut().enumerate() {
             spawner.spawn(web_task(task_id, stack, app, &CONFIG, buffers).unwrap());
         }
     }

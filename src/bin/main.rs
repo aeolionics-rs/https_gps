@@ -172,19 +172,19 @@ mod web {
     use alloc::boxed::Box;
     use embassy_executor::Spawner;
     use embassy_net::Stack;
+    use embassy_sync::pubsub::WaitResult;
     use esp_alloc::ExternalMemory;
-    use picoserve::response::File;
-    use picoserve::routing::{PathRouter, get_service};
+    use log::warn;
+    use picoserve::response::chunked::{ChunkWriter, ChunkedResponse, Chunks, ChunksWritten};
+    use picoserve::routing::{PathRouter, get};
     use picoserve::{AppBuilder, AppRouter};
+
+    use crate::gps;
 
     pub const HTTP_PORT: u16 = 80;
 
     /// Number of HTTP connections that can be served concurrently.
     pub const TASK_POOL_SIZE: usize = 4;
-
-    const INDEX_HTML: &str = "<!doctype html>\
-    <html><head><title>ESP32-S3</title></head>\
-    <body><h1>Hello from the ESP32-S3!</h1></body></html>\n";
 
     struct AppProps;
 
@@ -193,7 +193,39 @@ mod web {
 
         // Unknown paths get a 404 and other methods on "/" get a 405 from picoserve.
         fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-            picoserve::Router::new().route("/", get_service(File::html(INDEX_HTML)))
+            picoserve::Router::new().route("/", get(|| async { ChunkedResponse::new(NmeaStream) }))
+        }
+    }
+
+    /// Streams NMEA sentences from the GPS to the client until it disconnects.
+    struct NmeaStream;
+
+    impl Chunks for NmeaStream {
+        fn content_type(&self) -> &'static str {
+            "text/plain; charset=us-ascii"
+        }
+
+        async fn write_chunks<W: picoserve::io::Write>(
+            self,
+            mut writer: ChunkWriter<W>,
+        ) -> Result<ChunksWritten, W::Error> {
+            // There's a subscriber slot for every web task, so this can't fail.
+            let mut sentences = gps::SENTENCES
+                .subscriber()
+                .expect("no free NMEA subscriber slot");
+
+            // Runs until a write fails because the client has gone away.
+            loop {
+                match sentences.next_message().await {
+                    WaitResult::Message(sentence) => {
+                        writer.write_chunk(&sentence).await?;
+                        writer.flush().await?;
+                    }
+                    WaitResult::Lagged(n) => {
+                        warn!("NMEA stream client fell behind; skipped {n} sentences")
+                    }
+                }
+            }
         }
     }
 
@@ -246,9 +278,12 @@ mod web {
 /// ATGM336H-6N-74 GNSS module: logs the NMEA 0183 sentences it outputs.
 mod gps {
     use embassy_executor::Spawner;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::pubsub::PubSubChannel;
     use esp_hal::Async;
     use esp_hal::gpio::{InputPin, Level, Output, OutputConfig, OutputPin};
     use esp_hal::uart::{self, Uart, UartRx, UartTx};
+    use heapless::Vec;
     use log::{info, warn};
 
     /// The ATGM336H-6N-74 defaults to 115200 baud, 8N1.
@@ -256,6 +291,22 @@ mod gps {
 
     /// NMEA sentences are at most 82 characters; leave room for proprietary ones.
     const MAX_SENTENCE_LEN: usize = 128;
+
+    /// One NMEA sentence, including its trailing CR LF.
+    pub type Sentence = Vec<u8, { MAX_SENTENCE_LEN + 2 }>;
+
+    /// Sentences buffered for each subscriber before it starts missing them.
+    const QUEUE_LEN: usize = 16;
+
+    /// Every sentence received from the GPS, with one subscriber slot per web
+    /// task. Publishing never waits: subscribers that fall behind lose the oldest.
+    pub static SENTENCES: PubSubChannel<
+        CriticalSectionRawMutex,
+        Sentence,
+        QUEUE_LEN,
+        { crate::web::TASK_POOL_SIZE },
+        0,
+    > = PubSubChannel::new();
 
     /// Starts the GPS and spawns a task that logs each sentence it sends.
     ///
@@ -311,7 +362,7 @@ mod gps {
                 match byte {
                     b'\n' => {
                         if !discarding && len > 0 {
-                            log_sentence(&line[..len]);
+                            handle_sentence(&line[..len]);
                         }
                         len = 0;
                         discarding = false;
@@ -331,10 +382,21 @@ mod gps {
         }
     }
 
-    fn log_sentence(sentence: &[u8]) {
-        match core::str::from_utf8(sentence) {
-            Ok(sentence) if sentence.is_ascii() => info!("GPS: {sentence}"),
-            _ => warn!("GPS sent non-ASCII data; check the baud rate"),
-        }
+    /// Logs a sentence (without its line ending) and publishes it to [`SENTENCES`].
+    fn handle_sentence(sentence: &[u8]) {
+        let text = match core::str::from_utf8(sentence) {
+            Ok(text) if text.is_ascii() => text,
+            _ => {
+                warn!("GPS sent non-ASCII data; check the baud rate");
+                return;
+            }
+        };
+        info!("GPS: {text}");
+
+        let mut message = Sentence::new();
+        // Can't fail: `sentence` is at most MAX_SENTENCE_LEN bytes.
+        let _ = message.extend_from_slice(sentence);
+        let _ = message.extend_from_slice(b"\r\n");
+        SENTENCES.immediate_publisher().publish_immediate(message);
     }
 }

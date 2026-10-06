@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 #![deny(
     clippy::mem_forget,
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
@@ -8,10 +9,8 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{Runner, Stack, StackResources};
+use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
-use embedded_io_async::Write;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rng::Rng;
@@ -29,8 +28,6 @@ extern crate alloc;
 // (or the `[env]` table of `.cargo/esp-config.toml`) before building.
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
-
-const HTTP_PORT: u16 = 80;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -91,7 +88,8 @@ async fn main(spawner: Spawner) -> ! {
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    // One socket per web task, plus one for DHCP.
+    static RESOURCES: StaticCell<StackResources<{ web::TASK_POOL_SIZE + 1 }>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -102,29 +100,20 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    wait_for_ip(stack).await;
+    web::spawn(spawner, stack);
 
-    let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 1536];
-    let mut request_buffer = [0; 1024];
+    // Log the address each time DHCP (re)configures the interface.
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
-
-        if let Err(e) = socket.accept(HTTP_PORT).await {
-            warn!("accept error: {e:?}");
-            continue;
+        stack.wait_config_up().await;
+        if let Some(config) = stack.config_v4() {
+            info!(
+                "HTTP server listening on http://{}:{}/",
+                config.address.address(),
+                web::HTTP_PORT
+            );
         }
-        info!("connection from {:?}", socket.remote_endpoint());
-
-        if let Err(e) = handle_request(&mut socket, &mut request_buffer).await {
-            warn!("connection error: {e:?}");
-        }
-
-        socket.close();
-        // Give the stack a moment to send the FIN before the socket is dropped.
-        Timer::after(Duration::from_millis(50)).await;
-        socket.abort();
+        stack.wait_config_down().await;
+        warn!("Lost IP configuration");
     }
 }
 
@@ -154,85 +143,88 @@ async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
 
-async fn wait_for_ip(stack: Stack<'_>) {
-    stack.wait_link_up().await;
-    info!("Waiting for DHCP...");
-    stack.wait_config_up().await;
-    if let Some(config) = stack.config_v4() {
-        info!("Got IP: {}", config.address.address());
-        info!(
-            "HTTP server listening on http://{}:{HTTP_PORT}/",
-            config.address.address()
+/// HTTP server: a pool of picoserve tasks sharing one router.
+mod web {
+    #![allow(
+        clippy::large_stack_frames,
+        reason = "picoserve's server future is large and is moved into the task pool when \
+        spawned; embassy's task macro doesn't forward attributes to its generated wrapper"
+    )]
+
+    use embassy_executor::Spawner;
+    use embassy_net::Stack;
+    use picoserve::response::File;
+    use picoserve::routing::{PathRouter, get_service};
+    use picoserve::{AppBuilder, AppRouter};
+    use static_cell::ConstStaticCell;
+
+    pub const HTTP_PORT: u16 = 80;
+
+    /// Number of HTTP connections that can be served concurrently.
+    pub const TASK_POOL_SIZE: usize = 4;
+
+    const INDEX_HTML: &str = "<!doctype html>\
+    <html><head><title>ESP32-S3</title></head>\
+    <body><h1>Hello from the ESP32-S3!</h1></body></html>\n";
+
+    struct AppProps;
+
+    impl AppBuilder for AppProps {
+        type PathRouter = impl PathRouter;
+
+        // Unknown paths get a 404 and other methods on "/" get a 405 from picoserve.
+        fn build_app(self) -> picoserve::Router<Self::PathRouter> {
+            picoserve::Router::new().route("/", get_service(File::html(INDEX_HTML)))
+        }
+    }
+
+    /// Per-connection buffers for one web task.
+    struct Buffers {
+        tcp_rx: [u8; 1536],
+        tcp_tx: [u8; 1536],
+        http: [u8; 2048],
+    }
+
+    /// Spawns [`TASK_POOL_SIZE`] server tasks listening on [`HTTP_PORT`].
+    pub fn spawn(spawner: Spawner, stack: Stack<'static>) {
+        let app = picoserve::make_static!(AppRouter<AppProps>, AppProps.build_app());
+        static CONFIG: picoserve::Config =
+            picoserve::Config::const_default().keep_connection_alive();
+
+        // Built at compile time so the buffers never pass through the stack.
+        static BUFFERS: ConstStaticCell<[Buffers; TASK_POOL_SIZE]> = ConstStaticCell::new(
+            [const {
+                Buffers {
+                    tcp_rx: [0; 1536],
+                    tcp_tx: [0; 1536],
+                    http: [0; 2048],
+                }
+            }; TASK_POOL_SIZE],
         );
-    }
-}
 
-/// Reads one HTTP request from `socket` into `buffer` and writes a response.
-async fn handle_request(
-    socket: &mut TcpSocket<'_>,
-    buffer: &mut [u8],
-) -> Result<(), embassy_net::tcp::Error> {
-    let mut len = 0;
-
-    // Read until the end of the request headers (or the buffer is full).
-    loop {
-        let n = socket.read(&mut buffer[len..]).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        len += n;
-        if buffer[..len].windows(4).any(|w| w == b"\r\n\r\n") || len == buffer.len() {
-            break;
+        for (task_id, buffers) in BUFFERS.take().iter_mut().enumerate() {
+            spawner.spawn(web_task(task_id, stack, app, &CONFIG, buffers).unwrap());
         }
     }
 
-    // Request line is "<METHOD> <PATH> HTTP/1.x".
-    let mut parts = buffer[..len]
-        .split(|&b| b == b'\r' || b == b'\n')
-        .next()
-        .unwrap_or_default()
-        .split(|&b| b == b' ');
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
-    log_request(method, path);
-
-    let response: &[u8] = match (method, path) {
-        (b"GET", b"/") => {
-            b"HTTP/1.1 200 OK\r\n\
-              Content-Type: text/html; charset=utf-8\r\n\
-              Connection: close\r\n\
-              \r\n\
-              <!doctype html>\
-              <html><head><title>ESP32-S3</title></head>\
-              <body><h1>Hello from the ESP32-S3!</h1></body></html>\r\n"
-        }
-        (b"GET", _) => {
-            b"HTTP/1.1 404 Not Found\r\n\
-              Content-Type: text/plain\r\n\
-              Connection: close\r\n\
-              \r\n\
-              Not Found\r\n"
-        }
-        _ => {
-            b"HTTP/1.1 405 Method Not Allowed\r\n\
-              Allow: GET\r\n\
-              Content-Type: text/plain\r\n\
-              Connection: close\r\n\
-              \r\n\
-              Method Not Allowed\r\n"
-        }
-    };
-
-    socket.write_all(response).await?;
-    socket.flush().await
-}
-
-// Kept out of line so the formatting machinery doesn't bloat `handle_request`'s stack frame.
-#[inline(never)]
-fn log_request(method: &[u8], path: &[u8]) {
-    info!(
-        "{} {}",
-        core::str::from_utf8(method).unwrap_or("?"),
-        core::str::from_utf8(path).unwrap_or("?")
-    );
+    /// Each task serves one connection at a time.
+    #[embassy_executor::task(pool_size = TASK_POOL_SIZE)]
+    async fn web_task(
+        task_id: usize,
+        stack: Stack<'static>,
+        app: &'static AppRouter<AppProps>,
+        config: &'static picoserve::Config,
+        buffers: &'static mut Buffers,
+    ) -> ! {
+        picoserve::Server::new(app, config, &mut buffers.http)
+            .listen_and_serve(
+                task_id,
+                stack,
+                HTTP_PORT,
+                &mut buffers.tcp_rx,
+                &mut buffers.tcp_tx,
+            )
+            .await
+            .into_never()
+    }
 }

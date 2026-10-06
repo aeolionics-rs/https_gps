@@ -66,6 +66,15 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
     esp_alloc::heap_allocator!(size: 32 * 1024);
 
+    // The module's 8 MB of PSRAM extends the heap. Regions are used in the
+    // order they're added, so this is only used once internal RAM is full.
+    // Interface mode (quad/octal) and size are detected at runtime.
+    // Note: atomics don't work in PSRAM on the ESP32-S3, so never heap-allocate
+    // anything containing an `Atomic*`.
+    let psram = esp_hal::psram::Psram::new(peripherals.PSRAM, Default::default());
+    esp_alloc::psram_allocator!(&psram);
+    info!("PSRAM heap: {} KB", psram.raw_parts().1 / 1024);
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 

@@ -103,7 +103,7 @@ async fn main(spawner: Spawner) -> ! {
     // minimum retransmission timeout.
     let controller_config = ControllerConfig::default()
         .with_initial_config(station_config)
-        .with_rx_queue_size(16)
+        .with_rx_queue_size(32)
         .with_tx_queue_size(8);
     let controller = WifiController::new(peripherals.WIFI, controller_config)
         .expect("Failed to initialize Wi-Fi controller");
@@ -314,7 +314,9 @@ mod gps {
     pub type Sentence = Vec<u8, { MAX_SENTENCE_LEN + 2 }>;
 
     /// Sentences buffered for each subscriber before it starts missing them.
-    const QUEUE_LEN: usize = 16;
+    /// About 4 s of output, so a client can ride out a TCP retransmission
+    /// (smoltcp waits at least 1 s) without skipping sentences.
+    const QUEUE_LEN: usize = 64;
 
     /// Every sentence received from the GPS, with one subscriber slot per web
     /// task. Publishing never waits: subscribers that fall behind lose the oldest.
@@ -341,7 +343,12 @@ mod gps {
         // Hold the GPS out of reset.
         let reset = Output::new(gps_reset, Level::High, OutputConfig::default());
 
-        let config = uart::Config::default().with_baudrate(BAUD_RATE);
+        // Wake the reader when the 128-byte RX FIFO holds 32 bytes, leaving
+        // ~8 ms of headroom at 115200 baud. The default (120) leaves under
+        // 1 ms, which overflows when the executor is busy with network traffic.
+        let config = uart::Config::default()
+            .with_baudrate(BAUD_RATE)
+            .with_rx(uart::RxConfig::default().with_fifo_full_threshold(32));
         let (rx, tx) = Uart::new(uart, config)
             .expect("invalid GPS UART config")
             .with_rx(gps_tx)

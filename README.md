@@ -11,7 +11,7 @@ chunked `text/plain` response. It is `no_std` Rust built on
 
 ## Hardware
 
-- An [M5Stack AtomS3R](https://docs.m5stack.com/en/core/AtomS3R), based on a ESP32-S3-PICO-1-N8R8.
+- An [M5Stack AtomS3R](https://docs.m5stack.com/en/core/AtomS3R), based on an ESP32-S3-PICO-1-N8R8.
 - An [ATGM336H-6N-74 GPS](https://docs.m5stack.com/en/atom/Atomic_GPS_Base_v2.0) module at 115200 baud, wired as follows:
 
 | GPS module pin | ESP32-S3 | Purpose |

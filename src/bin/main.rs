@@ -77,9 +77,11 @@ async fn main(spawner: Spawner) -> ! {
     info!("PSRAM heap: {} KB", psram.raw_parts().1 / 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    esp_rtos::start_with_idle_hook(timg0.timer0, peripherals.FROM_CPU_INTR0, stats::idle_hook);
 
     info!("Embassy initialized!");
+
+    spawner.spawn(stats::stats_task().unwrap());
 
     gps::spawn(
         spawner,
@@ -284,7 +286,7 @@ mod gps {
     use esp_hal::gpio::{InputPin, Level, Output, OutputConfig, OutputPin};
     use esp_hal::uart::{self, Uart, UartRx, UartTx};
     use heapless::Vec;
-    use log::{info, warn};
+    use log::warn;
 
     /// The ATGM336H-6N-74 defaults to 115200 baud, 8N1.
     const BAUD_RATE: u32 = 115_200;
@@ -382,21 +384,89 @@ mod gps {
         }
     }
 
-    /// Logs a sentence (without its line ending) and publishes it to [`SENTENCES`].
+    /// Publishes a sentence (without its line ending) to [`SENTENCES`].
     fn handle_sentence(sentence: &[u8]) {
-        let text = match core::str::from_utf8(sentence) {
-            Ok(text) if text.is_ascii() => text,
-            _ => {
-                warn!("GPS sent non-ASCII data; check the baud rate");
-                return;
-            }
-        };
-        info!("GPS: {text}");
+        if !sentence.is_ascii() {
+            warn!("GPS sent non-ASCII data; check the baud rate");
+            return;
+        }
 
         let mut message = Sentence::new();
         // Can't fail: `sentence` is at most MAX_SENTENCE_LEN bytes.
         let _ = message.extend_from_slice(sentence);
         let _ = message.extend_from_slice(b"\r\n");
         SENTENCES.immediate_publisher().publish_immediate(message);
+    }
+}
+
+/// Periodic CPU and heap usage logging.
+mod stats {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use embassy_time::Timer;
+    use esp_alloc::MemoryCapability;
+    use esp_hal::time::{Duration, Instant};
+    use log::info;
+
+    const INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Microseconds the CPU has spent idle. Wraps after ~71 minutes, which is
+    /// fine because only differences over one [`INTERVAL`] are used.
+    static IDLE_MICROS: AtomicU32 = AtomicU32::new(0);
+
+    /// esp-rtos idle hook that counts idle time.
+    ///
+    /// Unlike the default hook it spins rather than waiting for an interrupt,
+    /// because esp-rtos abandons the hook (without notice) when a task becomes
+    /// ready, so time has to be counted as it passes. Time spent in interrupt
+    /// handlers that preempt the hook is counted as idle.
+    pub extern "C" fn idle_hook() -> ! {
+        let mut last = Instant::now();
+        loop {
+            let now = Instant::now();
+            IDLE_MICROS.fetch_add((now - last).as_micros() as u32, Ordering::Relaxed);
+            last = now;
+        }
+    }
+
+    /// Logs CPU usage (of the core esp-rtos runs on) and heap usage every [`INTERVAL`].
+    #[embassy_executor::task]
+    pub async fn stats_task() {
+        let mut last_time = Instant::now();
+        let mut last_idle = IDLE_MICROS.load(Ordering::Relaxed);
+
+        loop {
+            Timer::after_millis(INTERVAL.as_millis()).await;
+
+            let now = Instant::now();
+            let idle = IDLE_MICROS.load(Ordering::Relaxed);
+            let elapsed = (now - last_time).as_micros();
+            let idle_delta = u64::from(idle.wrapping_sub(last_idle)).min(elapsed);
+            let busy_permille = 1000 - idle_delta * 1000 / elapsed;
+            last_time = now;
+            last_idle = idle;
+
+            let (mut internal_used, mut internal_size) = (0, 0);
+            let (mut psram_used, mut psram_size) = (0, 0);
+            for region in esp_alloc::HEAP.stats().region_stats.iter().flatten() {
+                if region.capabilities.contains(MemoryCapability::External) {
+                    psram_used += region.used;
+                    psram_size += region.size;
+                } else {
+                    internal_used += region.used;
+                    internal_size += region.size;
+                }
+            }
+
+            info!(
+                "CPU {}.{}% | heap: internal {}/{} KB, PSRAM {}/{} KB",
+                busy_permille / 10,
+                busy_permille % 10,
+                internal_used / 1024,
+                internal_size / 1024,
+                psram_used / 1024,
+                psram_size / 1024,
+            );
+        }
     }
 }

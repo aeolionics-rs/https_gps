@@ -81,6 +81,14 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
+    gps::spawn(
+        spawner,
+        peripherals.UART1,
+        peripherals.GPIO5,
+        peripherals.GPIO6,
+        peripherals.GPIO7,
+    );
+
     let station_config = Config::Station(
         StationConfig::default()
             .with_ssid(SSID.try_into().expect("SSID is too long"))
@@ -232,5 +240,101 @@ mod web {
             )
             .await
             .into_never()
+    }
+}
+
+/// ATGM336H-6N-74 GNSS module: logs the NMEA 0183 sentences it outputs.
+mod gps {
+    use embassy_executor::Spawner;
+    use esp_hal::Async;
+    use esp_hal::gpio::{InputPin, Level, Output, OutputConfig, OutputPin};
+    use esp_hal::uart::{self, Uart, UartRx, UartTx};
+    use log::{info, warn};
+
+    /// The ATGM336H-6N-74 defaults to 115200 baud, 8N1.
+    const BAUD_RATE: u32 = 115_200;
+
+    /// NMEA sentences are at most 82 characters; leave room for proprietary ones.
+    const MAX_SENTENCE_LEN: usize = 128;
+
+    /// Starts the GPS and spawns a task that logs each sentence it sends.
+    ///
+    /// Pins are named from the GPS's side: `gps_tx` is its TXD0 output (module
+    /// pin 2, our RX), `gps_rx` its RXD0 input (pin 3, our TX), and `gps_reset`
+    /// its active-low nRESET (pin 9).
+    pub fn spawn(
+        spawner: Spawner,
+        uart: impl uart::Instance + 'static,
+        gps_tx: impl InputPin + 'static,
+        gps_rx: impl OutputPin + 'static,
+        gps_reset: impl OutputPin + 'static,
+    ) {
+        // Hold the GPS out of reset.
+        let reset = Output::new(gps_reset, Level::High, OutputConfig::default());
+
+        let config = uart::Config::default().with_baudrate(BAUD_RATE);
+        let (rx, tx) = Uart::new(uart, config)
+            .expect("invalid GPS UART config")
+            .with_rx(gps_tx)
+            .with_tx(gps_rx)
+            .into_async()
+            .split();
+
+        spawner.spawn(gps_task(rx, tx, reset).unwrap());
+    }
+
+    // `_tx` and `_reset` are held so their pins stay configured; TX is unused
+    // until we need to send commands to the GPS.
+    #[embassy_executor::task]
+    async fn gps_task(
+        mut rx: UartRx<'static, Async>,
+        _tx: UartTx<'static, Async>,
+        _reset: Output<'static>,
+    ) {
+        let mut chunk = [0u8; 64];
+        let mut line = [0u8; MAX_SENTENCE_LEN];
+        let mut len = 0;
+        // Set when a line overflows `line` or is corrupted; skip to the next newline.
+        let mut discarding = false;
+
+        loop {
+            let n = match rx.read_async(&mut chunk).await {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("GPS UART error: {e:?}");
+                    discarding = true;
+                    continue;
+                }
+            };
+
+            for &byte in &chunk[..n] {
+                match byte {
+                    b'\n' => {
+                        if !discarding && len > 0 {
+                            log_sentence(&line[..len]);
+                        }
+                        len = 0;
+                        discarding = false;
+                    }
+                    b'\r' => {}
+                    _ if discarding => {}
+                    _ if len == line.len() => {
+                        warn!("GPS sentence longer than {MAX_SENTENCE_LEN} bytes, dropped");
+                        discarding = true;
+                    }
+                    _ => {
+                        line[len] = byte;
+                        len += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn log_sentence(sentence: &[u8]) {
+        match core::str::from_utf8(sentence) {
+            Ok(sentence) if sentence.is_ascii() => info!("GPS: {sentence}"),
+            _ => warn!("GPS sent non-ASCII data; check the baud rate"),
+        }
     }
 }
